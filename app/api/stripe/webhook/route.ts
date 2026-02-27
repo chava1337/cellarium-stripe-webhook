@@ -129,49 +129,89 @@ function safeJsonParseForLog(rawBody: string): {
   }
 }
 
+const FORWARD_TIMEOUT_MS = 25000;
+
+type ForwardResult =
+  | { success: true; status: number }
+  | { success: false; status?: number; forwardError?: string; gatewayError?: { name: string; message: string; causeCode?: string } };
+
+type CauseLike = { code?: string; errno?: number; syscall?: string; hostname?: string; address?: string; port?: number };
+
 /**
- * Forward del webhook a Supabase con timeout de 10s
+ * Forward del webhook a Supabase con timeout configurado.
+ * Headers: INTERNAL_EDGE_AUTH_TOKEN (Bearer) + x-internal-webhook-secret; stripe-signature reenviado.
  */
 async function forwardToSupabase(
   rawBody: string,
-  stripeSignature: string
-): Promise<{ success: boolean; status?: number }> {
-  const supabaseUrl = process.env.SUPABASE_INTERNAL_WEBHOOK_URL;
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  stripeSignature: string,
+  contentType: string,
+  pingMode: boolean
+): Promise<ForwardResult> {
+  const rawUrl = process.env.SUPABASE_INTERNAL_WEBHOOK_URL;
+  const supabaseUrl = typeof rawUrl === "string" ? rawUrl.trim() : "";
   const internalSecret = process.env.INTERNAL_WEBHOOK_SHARED_SECRET;
+  // INTERNAL ONLY: token dedicado para que Supabase Edge valide el forward
+  const internalEdgeToken = process.env.INTERNAL_EDGE_AUTH_TOKEN?.trim();
 
-  if (!supabaseUrl || !serviceRoleKey) {
-    console.error("Missing SUPABASE_INTERNAL_WEBHOOK_URL or SUPABASE_SERVICE_ROLE_KEY");
-    return { success: false };
+  if (!internalEdgeToken) {
+    console.error("INTERNAL_EDGE_AUTH_TOKEN missing");
+    return { success: false, forwardError: "INTERNAL_EDGE_AUTH_TOKEN missing" };
+  }
+
+  if (!supabaseUrl) {
+    console.error("Missing SUPABASE_INTERNAL_WEBHOOK_URL");
+    return { success: false, forwardError: "Server configuration error" };
+  }
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(supabaseUrl);
+  } catch (e) {
+    console.error("Invalid SUPABASE_INTERNAL_WEBHOOK_URL:", (e as Error).message);
+    return { success: false, forwardError: "Invalid SUPABASE_INTERNAL_WEBHOOK_URL" };
+  }
+
+  if (parsedUrl.protocol !== "https:") {
+    console.error("SUPABASE_INTERNAL_WEBHOOK_URL must use https protocol");
+    return { success: false, forwardError: "SUPABASE_INTERNAL_WEBHOOK_URL must use https protocol" };
   }
 
   const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${serviceRoleKey}`,
+    "Content-Type": contentType || "application/json",
+    "stripe-signature": stripeSignature,
+    "Stripe-Signature": stripeSignature,
+    authorization: `Bearer ${internalEdgeToken}`,
   };
 
   if (internalSecret) {
     headers["x-internal-webhook-secret"] = internalSecret;
   }
 
-  // Opcional: reenviar stripe-signature
-  headers["stripe-signature"] = stripeSignature;
+  const body = pingMode
+    ? JSON.stringify({ ping: true, ts: new Date().toISOString() })
+    : rawBody;
 
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
+    const timeoutId = setTimeout(() => controller.abort(), FORWARD_TIMEOUT_MS);
 
     const response = await fetch(supabaseUrl, {
       method: "POST",
       headers,
-      body: rawBody,
+      body,
       signal: controller.signal,
     });
 
     clearTimeout(timeoutId);
 
+    console.log("[PROXY] forwarded", {
+      status: response.status,
+      ok: response.ok,
+      targetHost: parsedUrl.hostname,
+      targetPath: parsedUrl.pathname,
+    });
+
     if (!response.ok) {
-      // Leer response body para log (máx 300 chars)
       let errorBody = "";
       try {
         const text = await response.text();
@@ -187,12 +227,34 @@ async function forwardToSupabase(
 
     return { success: true, status: response.status };
   } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      console.error("Timeout forwarding to Supabase (10s)");
-    } else {
-      console.error("Error forwarding to Supabase:", error);
-    }
-    return { success: false };
+    const err = error as Error & { cause?: CauseLike };
+    const c = err.cause;
+    const causeCode = c?.code ?? c?.errno?.toString() ?? c?.syscall ?? undefined;
+    const safeDebug = {
+      name: err.name,
+      message: err.message,
+      causeCode: c?.code,
+      errno: c?.errno,
+      syscall: c?.syscall,
+      causeHostname: c?.hostname,
+      causeAddress: c?.address,
+      causePort: c?.port,
+      urlProtocol: parsedUrl.protocol,
+      urlHostname: parsedUrl.hostname,
+      urlPathname: parsedUrl.pathname,
+      timeoutMs: FORWARD_TIMEOUT_MS,
+    };
+    console.error("Forward fetch failed (safe debug):", safeDebug);
+
+    return {
+      success: false,
+      status: 502,
+      gatewayError: {
+        name: err.name,
+        message: err.message,
+        causeCode: causeCode ?? c?.code,
+      },
+    };
   }
 }
 
@@ -245,18 +307,51 @@ export async function POST(request: Request) {
       });
     }
 
-    // Parsear para logging (no crítico si falla)
     const eventInfo = safeJsonParseForLog(rawBody);
-    if (eventInfo.type && eventInfo.id) {
-      console.log(`Stripe webhook: ${eventInfo.type} (${eventInfo.id})`);
-    }
+    console.log("[PROXY] received", {
+      eventType: eventInfo.type ?? "(unknown)",
+      eventId: eventInfo.id ?? "(unknown)",
+      hasSig: true,
+      len: rawBody.length,
+    });
 
-    // Forward a Supabase
-    const forwardResult = await forwardToSupabase(rawBody, stripeSignature);
+    const contentType = request.headers.get("content-type") || "application/json";
+    const pingMode = process.env.SUPABASE_PING_MODE === "true";
+
+    const forwardResult = await forwardToSupabase(rawBody, stripeSignature, contentType, pingMode);
 
     if (!forwardResult.success) {
+      if (forwardResult.gatewayError) {
+        return new Response(
+          JSON.stringify({
+            error: "Failed to forward to Supabase",
+            details: {
+              name: forwardResult.gatewayError.name,
+              message: forwardResult.gatewayError.message,
+              causeCode: forwardResult.gatewayError.causeCode,
+            },
+          }),
+          {
+            status: 502,
+            headers: {
+              "Content-Type": "application/json",
+            },
+          }
+        );
+      }
+      if (forwardResult.forwardError) {
+        return new Response(
+          JSON.stringify({ error: forwardResult.forwardError }),
+          {
+            status: 500,
+            headers: {
+              "Content-Type": "application/json",
+            },
+          }
+        );
+      }
       console.error(
-        `Failed to forward to Supabase. Status: ${forwardResult.status || "N/A"}`
+        `Failed to forward to Supabase. Status: ${forwardResult.status ?? "N/A"}`
       );
       return new Response(
         JSON.stringify({ error: "Failed to forward webhook" }),
