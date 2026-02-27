@@ -259,6 +259,15 @@ async function forwardToSupabase(
 }
 
 export async function POST(request: Request) {
+  const requestId = randomUUID();
+  const startedAt = new Date();
+
+  console.log("[PROXY_WEBHOOK] handler_enter", {
+    requestId,
+    v: "proxy@d433e09",
+    ts: startedAt.toISOString(),
+  });
+
   try {
     // Leer raw body
     const rawBody = await request.text();
