@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "crypto";
+import crypto, { createHmac, timingSafeEqual } from "crypto";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -259,7 +259,10 @@ async function forwardToSupabase(
 }
 
 export async function POST(request: Request) {
-  const requestId = randomUUID();
+  const requestId =
+    typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `req_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   const startedAt = new Date();
 
   console.log("[PROXY_WEBHOOK] handler_enter", {
